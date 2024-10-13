@@ -7,11 +7,12 @@ from typing import Annotated, Optional
 import typer
 
 from loguru import logger
+from paramiko.ssh_exception import SSHException
 from rich.logging import RichHandler
 from rich.progress import track, Progress, SpinnerColumn, TextColumn
 
 from .pushing import RemoteServer
-from .structures import Settings
+from .structures import Settings, ServerPushScripts
 
 app = typer.Typer()
 
@@ -57,9 +58,13 @@ def config_path_validate(value: pathlib.Path):
         raise typer.BadParameter("Non-exist config file")
     return value
 
+def use_variant(scripts: ServerPushScripts, variant: str):
+    if scripts.before_push is not None:
+        scripts.before_push = scripts.before_push.with_name(f"{variant}-{scripts.before_push.name}")
+    if scripts.after_push is not None:
+        scripts.after_push = scripts.after_push.with_name(f'{variant}-{scripts.after_push.name}')
 
 @app.command()
-@logger.catch(reraise=True)
 def push(
         servers: Annotated[list[str], typer.Argument(help="servers to publish the config")] = None,
         config_path: Annotated[
@@ -72,7 +77,22 @@ def push(
                 callback=config_path_validate
             )
         ] = None,
+        scripts_variant: Annotated[
+            Optional[str],
+            typer.Option(
+                "-v",
+                "--variant",
+                help="script variant"
+            )
+        ] = None
 ):
+    if scripts_variant is not None:
+        for server in settings.servers.values():
+            scripts = server.scripts.model_copy()
+            use_variant(scripts, scripts_variant)
+            server.scripts = scripts
+        use_variant(settings.scripts, scripts_variant)
+
     targets = set()
     if servers is None:
         servers = settings.servers.keys()
@@ -94,13 +114,31 @@ def push(
             TextColumn("[progress.description]{task.description}"),
             transient=True,
     ) as progress:
-        for target in targets:
-            logger.info(f"connecting to server `{target.name}`")
-            task_id = progress.add_task(description=f"Pushing to {target.name}...", total=None)
-            server = RemoteServer(target)
-            server.connect()
-            server.push_config(config_path.open("r", encoding="utf-8"), settings.target_path)
-            progress.remove_task(task_id)
+        with config_path.open("r", encoding='u8') as config_fp:
+            successes = []
+            failures = []
+            for target in targets:
+                if target.config_path is not None:
+                    file_io = target.config_path.open("r", encoding="utf-8")
+                else:
+                    config_fp.seek(0)
+                    file_io = config_fp
+                logger.info(f"connecting to server `{target.name}`")
+                task_id = progress.add_task(description=f"Pushing to {target.name}...", total=None)
+                server = RemoteServer(target)
+                try:
+                    server.connect()
+                    server.push_config(file_io, settings.target_path)
+                    progress.remove_task(task_id)
+                    successes.append(target.name)
+                except SSHException as e:
+                    logger.warning(f"cannot push to `{target.name}`: {{exc}}", exc=e)
+                    progress.remove_task(task_id)
+                    failures.append(target.name)
+                    continue
+            logger.info("successfully pushed to {}", successes)
+            if failures:
+                logger.info("failed to push to {}", failures)
 
 
 if __name__ == "__main__":
